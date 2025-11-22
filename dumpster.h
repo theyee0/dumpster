@@ -1,9 +1,26 @@
 #include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #define PAGE_SIZE 4096
-#define TAG(ptr, tag) (((ptr) & 0xfffffffc) | ((tag) & 0x4))
-#define TAGOF(ptr) ((ptr) & 0x4)
-#define UNTAG(ptr) ((ptr) & 0xfffffffc)
+
+void *tag(void *ptr, unsigned long long int tag) {
+        unsigned long long int ptrl = (unsigned long long int)ptr;
+
+        return (void*)((ptrl & (~0x4)) | (tag & 0x4));
+}
+
+void *untag(void *ptr) {
+        unsigned long long int ptrl = (unsigned long long int)ptr;
+
+        return (void*)(ptrl & (~0x4));
+}
+
+unsigned long long int tagof(void *ptr) {
+        unsigned long long int ptrl = (unsigned long long int)ptr;
+
+        return ptrl & 0x4;
+}
 
 /* Memory page item */
 struct header {
@@ -74,7 +91,7 @@ static struct header *morecore(size_t num_units) {
         /* Update pointer at end to reflect new memory */
         new_block = (struct header*)p;
         new_block->size = num_units;
-        add_to_free_list(new_block);
+        add_to_free(new_block);
 
         return freep;
 }
@@ -91,7 +108,7 @@ void *dumpster_alloc(size_t alloc_size) {
         prev = freep;
 
         for (cur = prev->next;; prev = cur, cur = prev->next) {
-                if (cur->size < num_units) {
+                if (cur->size < units) {
                         if (cur == freep) {
                                 cur = morecore(units);
                                 if (cur == NULL) {
@@ -100,11 +117,11 @@ void *dumpster_alloc(size_t alloc_size) {
                         }
 
                         continue;
-                } else if (cur->size > num_units) {
+                } else if (cur->size > units) {
                         /* Add the desired new block to the end of the oversized block */
-                        cur->size -= num_units;
+                        cur->size -= units;
                         cur += cur->size;
-                        cur->size = num_units;
+                        cur->size = units;
                 } else {
                         /* Extract the current block from the list and join surrounding blocks */
                         prev->next = cur->next;
@@ -131,11 +148,12 @@ static void scan_region(void *start, void *end) {
 
                 /* Iterate through blocks to identify and tag the block an address is from */
                 do {
-                        if (block + 1 <= memval && memval < block + block->size + 1) {
-                                block->next = block->next | 1;
+                        if ((void*)(block + 1) <= memval &&
+                            memval < (void*)(block + block->size + 1)) {
+                                block->next = tag(block->next, 1);
                                 break;
                         }
-                } while ((block = UNTAG(bp->next)) != usedp);
+                } while ((block = untag(block->next)) != usedp);
         }
 }
 
@@ -149,22 +167,23 @@ static void scan_heap(void) {
         struct header *block, *search;
 
         /* Iterate over all blocks in the used block list */
-        for (block = UNTAG(usedp->next); block != usedp; block = UNTAG(block->next)) {
+        for (block = untag(usedp->next); block != usedp; block = untag(block->next)) {
                 /* Skip block if it has already been considered and marked as not-in-use */
-                if (block->next & 1 == 0) {
+                if (tagof(block->next) == 0) {
                         continue;
                 }
 
                 /* Iterate over words in block to find any references to blocks to be freed */
-                for (cur = block + 1; cur < block + block->size + 1; cur++) {
+                for (cur = block + 1; cur < (void*)(block + block->size + 1); cur++) {
                         /* Read a potential address from memory */
                         memval = *(void**)cur;
 
                         /* Identify the block a memory address belongs to and tag it as in-use */
-                        for (search = block->next; UNTAG(search) != block; search = UNTAG(search->next)) {
+                        for (search = block->next; untag(search) != block; search = untag(search->next)) {
                                 if (search != block &&
-                                    search + 1 <= memval && memval <= search + search->size + 1) {
-                                        search->next = TAG(search->next, 1);
+                                    (void*)(search + 1) <= memval &&
+                                    memval <= (void*)(search + search->size + 1)) {
+                                        search->next = tag(search->next, 1);
                                         break;
                                 }
                         }
@@ -179,7 +198,7 @@ void dumpster_init(void)
 {
         FILE *fp;
 
-        if (inititalized) {
+        if (initialized) {
                 return;
         }
 
@@ -193,7 +212,7 @@ void dumpster_init(void)
                "%*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld "
                "%*ld %*ld %*ld %*ld %*llu %*lu %*ld "
                "%*lu %*lu %*lu %lu",
-               &stack_bottom);
+               &stack_base);
 
         fclose(fp);
 
@@ -220,25 +239,24 @@ void dumpster_collect(void) {
         /* Scan data segment */
         scan_region(&etext, &end);
 
-
-        /* Move address of EBP into stack_top */
-        asm volatile ("movl %%ebp, %0" : "=r" (stack_top));
+        /* Move address of RBP into stack_top */
+        asm volatile ("mov %%rbp, %0" : "=r" (stack_top));
 
         /* Scan stack */
-        scan_region(stack_top, stack_bottom);
+        scan_region(stack_top, stack_base);
 
         /* Scan heap */
         scan_heap();
 
         prev = usedp;
-        cur = UNTAG(usedp->next);
+        cur = untag(usedp->next);
 
         /* Stop when all nodes have been searched */
         while (cur != usedp) {
-                if (TAGOF(cur->next) != 1) {
+                if (tagof(cur->next) != 1) {
                         /* Free a block and reconnect the surrounding linked list */
                         tmp = cur;
-                        cur = UNTAG(cur->next);
+                        cur = untag(cur->next);
                         add_to_free(tmp);
 
                         /* Freed final block in the used list */
@@ -247,9 +265,9 @@ void dumpster_collect(void) {
                                 break;
                         }
 
-                        prev->next = p | TAGOF(prev->next);
+                        prev->next = tag(cur, tagof(prev->next));
                 } else {
-                        p->next = UNTAG(p);
+                        cur->next = untag(cur);
                 }
         }
 }
