@@ -2,6 +2,7 @@
 
 #define PAGE_SIZE 4096
 #define TAG(ptr, tag) (((ptr) & 0xfffffffc) | ((tag) & 0x4))
+#define TAGOF(ptr) ((ptr) & 0x4)
 #define UNTAG(ptr) ((ptr) & 0xfffffffc)
 
 /* Memory page item */
@@ -10,6 +11,12 @@ struct header {
         struct header *next;
 };
 
+static int initialized = 0;
+
+static void *stack_base;
+static void *stack_top;
+
+/* Circular linked lists */
 static struct header base;
 static struct header *freep = &base;
 static struct header *usedp;
@@ -161,6 +168,88 @@ static void scan_heap(void) {
                                         break;
                                 }
                         }
+                }
+        }
+}
+
+/*
+  Find the address of the stack's beginning and initialize variables
+*/
+void dumpster_init(void)
+{
+        FILE *fp;
+
+        if (inititalized) {
+                return;
+        }
+
+        /* Read stack address from /proc */
+        fp = fopen("/proc/self/stat", "r");
+        if (fp == NULL) {
+                return;
+        }
+        fscanf(fp,
+               "%*d %*s %*c %*d %*d %*d %*d %*d %*u "
+               "%*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld "
+               "%*ld %*ld %*ld %*ld %*llu %*lu %*ld "
+               "%*lu %*lu %*lu %lu",
+               &stack_bottom);
+
+        fclose(fp);
+
+        /* Initialize "empty" linked list of used blocks */
+        usedp = NULL;
+
+        /* Initialize free linked list as a circular empty linked list */
+        base.next = freep = &base;
+        base.size = 0;
+}
+
+/*
+  Identify orphaned memory blocks and free them
+*/
+void dumpster_collect(void) {
+        struct header *cur, *prev, *tmp;
+        extern char end, etext;
+
+        /* No memory has been allocated */
+        if (usedp == NULL) {
+                return;
+        }
+
+        /* Scan data segment */
+        scan_region(&etext, &end);
+
+
+        /* Move address of EBP into stack_top */
+        asm volatile ("movl %%ebp, %0" : "=r" (stack_top));
+
+        /* Scan stack */
+        scan_region(stack_top, stack_bottom);
+
+        /* Scan heap */
+        scan_heap();
+
+        prev = usedp;
+        cur = UNTAG(usedp->next);
+
+        /* Stop when all nodes have been searched */
+        while (cur != usedp) {
+                if (TAGOF(cur->next) != 1) {
+                        /* Free a block and reconnect the surrounding linked list */
+                        tmp = cur;
+                        cur = UNTAG(cur->next);
+                        add_to_free(tmp);
+
+                        /* Freed final block in the used list */
+                        if (usedp == tmp) {
+                                usedp = NULL;
+                                break;
+                        }
+
+                        prev->next = p | TAGOF(prev->next);
+                } else {
+                        p->next = UNTAG(p);
                 }
         }
 }
