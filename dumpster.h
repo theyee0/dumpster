@@ -1,28 +1,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <errno.h>
 
 #define PAGE_SIZE 4096
-
-void *tag(void *ptr, unsigned long long int tag) {
-        unsigned long long int ptrl = (unsigned long long int)ptr;
-
-        return (void*)((ptrl & (~0x4)) | (tag & 0x4));
-}
-
-void *untag(void *ptr) {
-        unsigned long long int ptrl = (unsigned long long int)ptr;
-
-        return (void*)(ptrl & (~0x4));
-}
-
-unsigned long long int tagof(void *ptr) {
-        unsigned long long int ptrl = (unsigned long long int)ptr;
-
-        return ptrl & 0x4;
-}
+#define MAX_DELAY 500
 
 /* Memory page item */
 struct header {
@@ -31,6 +15,7 @@ struct header {
 };
 
 static int initialized = 0;
+static int collecting = 0;
 
 static void *stack_base;
 static void *stack_top;
@@ -38,7 +23,42 @@ static void *stack_top;
 /* Circular linked lists */
 static struct header base;
 static struct header *freep = &base;
-static struct header *usedp;
+static struct header *usedp = &base;
+
+struct color_node {
+        struct header *p;
+        struct color_node *next;
+};
+
+struct timespec cur_time;
+
+/* Tri-color marking algorithm */
+static struct color_node *grey_list = NULL;
+static struct color_node *black_list = NULL;
+
+enum tags {
+        WHITE = 0x0,
+        BLACK = 0x1,
+        GREY = 0x2
+};
+
+void *tag(void *ptr, unsigned long long int tag) {
+        unsigned long long int ptrl = (unsigned long long int)ptr;
+
+        return (void*)((ptrl & (~0x3)) | (tag & 0x3));
+}
+
+void *untag(void *ptr) {
+        unsigned long long int ptrl = (unsigned long long int)ptr;
+
+        return (void*)(ptrl & (~0x3));
+}
+
+unsigned long long int tagof(void *ptr) {
+        unsigned long long int ptrl = (unsigned long long int)ptr;
+
+        return ptrl & 0x3;
+}
 
 /*
   Given a pointer to an allocated block, locate the corresponding gap in the free list where
@@ -92,7 +112,7 @@ static struct header *morecore(size_t num_units) {
                       MAP_SHARED | MAP_ANONYMOUS,
                       -1,
                       0)) == MAP_FAILED) {
-                perror(NULL);
+                perror("morecore()");
                 return NULL;
         }
 
@@ -235,7 +255,7 @@ void dumpster_init(void)
 }
 
 /*
-  Identify orphaned memory blocks and free them
+  Identify orphaned memory blocks and free them using "Mark and Sweep"
 */
 void dumpster_collect(void) {
         struct header *cur, *prev, *tmp;
@@ -263,7 +283,7 @@ void dumpster_collect(void) {
 
         /* Stop when all nodes have been searched */
         while (cur != usedp) {
-                if (tagof(cur->next) != 1) {
+                if (tagof(cur->next) != BLACK) {
                         /* Free a block and reconnect the surrounding linked list */
                         tmp = cur;
                         cur = untag(cur->next);
@@ -280,4 +300,179 @@ void dumpster_collect(void) {
                         cur->next = untag(cur);
                 }
         }
+}
+
+/*
+  Scan a contiguous memory region for pointers and tag corresponding blocks curerntly in use
+*/
+static void scan_region_incremental(void *start, void *end, struct timespec start_time) {
+        void *cur; /* Current address in memory being examined */
+        void *memval; /* Pointer read from value in memory */
+        struct header *block; /* Current block in memory */
+        struct color_node *tmp;
+
+        /* Iterate over all addresses, aligned to pointer size */
+        for (cur = start; cur < end; cur++) {
+                block = usedp;
+                memval = *(void**)cur;
+
+                /* Iterate through blocks to identify and tag the block an address is from */
+                do {
+                        if ((void*)(block + 1) <= memval &&
+                            memval < (void*)(block + block->size + 1)) {
+                                if (tagof(block->next) != WHITE) {
+                                        break;
+                                }
+
+                                /* Tag block and add to the grey list */
+                                block->next = tag(block->next, GREY);
+
+                                tmp = malloc(sizeof(*tmp));
+                                tmp->p = block->next;
+                                tmp->next = grey_list;
+                                grey_list = tmp;
+
+                                break;
+                        }
+
+                        clock_gettime(CLOCK_REALTIME, &cur_time);
+
+                        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                                return;
+                        }
+                } while ((block = untag(block->next)) != usedp);
+        }
+}
+
+/*
+  Scan the heap (consisting of the list of usedp) for references to blocks in use
+  and tag them as such
+*/
+static void scan_heap_incremental(struct timespec start_time) {
+        void *cur;
+        void *memval;
+        struct header *block, *search;
+        struct color_node *tmp;
+
+        /* Iterate over all blocks in the used block list */
+        while (grey_list != NULL) {
+                /* Skip block if it has already been considered and marked as not-in-use */
+                block = untag(grey_list->p);
+
+                if (tagof(block->next) != BLACK) {
+                        /* Iterate over words in block to find any references to blocks to be freed */
+                        for (cur = block + 1; cur < (void*)(block + block->size + 1); cur++) {
+                                /* Read a potential address from memory */
+                                memval = *(void**)cur;
+
+                                /* Identify the block a memory address belongs to and tag it as in-use */
+                                for (search = block->next; untag(search) != block; search = untag(search->next)) {
+                                        if (search != block &&
+                                            (void*)(search + 1) <= memval &&
+                                            memval <= (void*)(search + search->size + 1)) {
+                                                if (tagof(search->next) != WHITE) {
+                                                        break;
+                                                }
+
+                                                search->next = tag(search->next, GREY);
+                                                tmp = malloc(sizeof(*tmp));
+                                                tmp->p = search->next;
+                                                tmp->next = grey_list;
+                                                grey_list = tmp->next;
+                                                break;
+                                        }
+
+                                        clock_gettime(CLOCK_REALTIME, &cur_time);
+
+                                        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                                                return;
+                                        }
+                                }
+                        }
+
+                        block->next = tag(block->next, BLACK);
+                        tmp = malloc(sizeof(*tmp));
+                        tmp->p = block;
+                        tmp->next = black_list;
+                        black_list = tmp;
+                }
+
+                tmp = grey_list->next;
+                free(grey_list);
+                grey_list = tmp;
+        }
+}
+
+void dumpster_collect_incremental() {
+        struct header *cur, *prev, *tmp;
+        extern char end, etext;
+        struct timespec start_time;
+
+        /* No memory has been allocated */
+        if (usedp == NULL) {
+                return;
+        }
+
+        if (!collecting) {
+                prev = usedp;
+
+                for (cur = untag(usedp->next); cur != usedp; cur = untag(cur->next)) {
+                        prev->next = tag(cur, WHITE);
+                }
+
+                collecting = 1;
+        }
+
+        clock_gettime(CLOCK_REALTIME, &start_time);
+        
+        /* Scan data segment */
+        scan_region_incremental(&etext, &end, start_time);
+        clock_gettime(CLOCK_REALTIME, &cur_time);
+
+        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                return;
+        }
+        /* Move address of RBP into stack_top */
+        asm volatile ("mov %%rbp, %0" : "=r" (stack_top));
+
+        /* Scan stack */
+        scan_region_incremental(stack_top, stack_base, start_time);
+        clock_gettime(CLOCK_REALTIME, &cur_time);
+
+        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                return;
+        }
+
+        /* Scan heap */
+        scan_heap_incremental(start_time);
+        clock_gettime(CLOCK_REALTIME, &cur_time);
+
+        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                return;
+        }
+
+        prev = usedp;
+        cur = untag(usedp->next);
+
+        /* Stop when all nodes have been searched */
+        while (cur != usedp) {
+                if (tagof(cur->next) == WHITE) {
+                        /* Free a block and reconnect the surrounding linked list */
+                        tmp = cur;
+                        cur = untag(cur->next);
+                        add_to_free(tmp);
+
+                        /* Freed final block in the used list */
+                        if (usedp == tmp) {
+                                usedp = NULL;
+                                break;
+                        }
+
+                        prev->next = tag(cur, tagof(prev->next));
+                } else {
+                        cur->next = untag(cur);
+                }
+        }
+
+        collecting = 0;
 }
