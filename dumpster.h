@@ -1,6 +1,8 @@
 #include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <sys/mman.h>
+#include <errno.h>
 
 #define PAGE_SIZE 4096
 
@@ -75,7 +77,7 @@ static void add_to_free(struct header *block) {
   Request more memory from the kernel
 */
 static struct header *morecore(size_t num_units) {
-        void *p; /* Pointer to location where new blcok will be added */
+        void *p; /* Pointer to location where new block will be added */
         struct header *new_block; /* Pointer to new block */
 
         /* Force the allocation to be at least the page size */
@@ -84,7 +86,13 @@ static struct header *morecore(size_t num_units) {
         }
 
         /* Attempt to allocate new memory and ensure it doesn't fail */
-        if ((p = sbrk(num_units * sizeof(struct header))) == (void*)-1) {
+        if ((p = mmap(NULL,
+                      num_units * sizeof(struct header),
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_ANONYMOUS,
+                      -1,
+                      0)) == MAP_FAILED) {
+                perror(NULL);
                 return NULL;
         }
 
@@ -215,6 +223,8 @@ void dumpster_init(void)
                &stack_base);
 
         fclose(fp);
+
+        initialized = 1;
 
         /* Initialize "empty" linked list of used blocks */
         usedp = NULL;
