@@ -132,7 +132,7 @@ static struct header *morecore(size_t num_units) {
 }
 
 /*
-  Allocate a new blcok of size at least `alloc_size` and return a pointer
+  Allocate a new block of size at least `alloc_size` and return a pointer
 */
 void *dumpster_alloc(size_t alloc_size) {
         size_t units;
@@ -175,17 +175,22 @@ void *dumpster_alloc(size_t alloc_size) {
   memory address and tag it with a specified color
 */
 static void tag_unclean_block(struct header *list, void* memval, enum tags color_tag) {
-        struct header *block = list;
+        struct header *cur = list;
+
+        /* No memory blocks to tag */
+        if (list == NULL) {
+                return;
+        }
 
         do {
                 /* Tag the block if the memory address is between its bounds */
-                if (list != block &&
-                    (void*)(block + 1) <= memval &&
-                    memval <= (void*)(block + block->size + 1)) {
-                        block->next = tag(block->next, color_tag);
+                if (list != cur &&
+                    (void*)(cur + 1) <= memval &&
+                    memval <= (void*)(cur + cur->size + 1)) {
+                        cur->next = tag(cur->next, color_tag);
                         break;
                 }
-        } while ((block = untag(block->next)) != list);
+        } while ((cur = untag(cur->next)) != list);
 }
 
 /*
@@ -228,7 +233,7 @@ static void scan_heap(void) {
                         memval = *(void**)cur;
 
                         /* Identify the block a memory address belongs to and tag it as in-use */
-                        tag_unclean_block(block, memval, BLACK);
+                        tag_unclean_block(usedp, memval, BLACK);
                 }
         }
 }
@@ -297,7 +302,7 @@ void dumpster_collect(void) {
 
         /* Stop when all nodes have been searched */
         while (cur != usedp) {
-                if (tagof(cur->next) != BLACK) {
+                if (tagof(cur->next) == WHITE) {
                         /* Free a block and reconnect the surrounding linked list */
                         tmp = cur;
                         cur = untag(cur->next);
@@ -311,7 +316,7 @@ void dumpster_collect(void) {
 
                         prev->next = tag(cur, tagof(prev->next));
                 } else {
-                        cur->next = untag(cur);
+                        cur = untag(cur->next);
                 }
         }
 }
@@ -368,6 +373,7 @@ static void scan_region_incremental(void *start, void *end, struct timespec star
                 /* Iterate through blocks to identify and tag the block an address is from */
                 tag_unclean_block_incremental(usedp, memval, grey_list, GREY, start_time);
 
+                /* Return early if required */
                 clock_gettime(CLOCK_REALTIME, &cur_time);
 
                 if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
@@ -392,22 +398,28 @@ static void scan_heap_incremental(struct timespec start_time) {
                 block = untag(grey_list->p);
 
                 if (tagof(block->next) != BLACK) {
-                        /* Iterate over words in block to find any references to blocks to be freed */
-                        for (cur = block + 1; cur < (void*)(block + block->size + 1); cur++) {
-                                /* Read a potential address from memory */
-                                memval = *(void**)cur;
-
-                                /* Identify the block a memory address belongs to and tag it as in-use */
-                                tag_unclean_block_incremental(cur, memval, grey_list, GREY, start_time);
-                        }
-
-                        /* Tag the current block once all of its descendants have been searched */
-                        block->next = tag(block->next, BLACK);
-                        tmp = malloc(sizeof(*tmp));
-                        tmp->p = block;
-                        tmp->next = black_list;
-                        black_list = tmp;
+                        /* Move to the next element in the stack to search */
+                        tmp = grey_list->next;
+                        free(grey_list);
+                        grey_list = tmp;
+                        continue;
                 }
+
+                /* Iterate over words in block to find any references to blocks to be freed */
+                for (cur = block + 1; cur < (void*)(block + block->size + 1); cur++) {
+                        /* Read a potential address from memory */
+                        memval = *(void**)cur;
+
+                        /* Identify the block a memory address belongs to and tag it as in-use */
+                        tag_unclean_block_incremental(cur, memval, grey_list, GREY, start_time);
+                }
+
+                /* Tag the current block once all of its descendants have been searched */
+                block->next = tag(block->next, BLACK);
+                tmp = malloc(sizeof(*tmp));
+                tmp->p = block;
+                tmp->next = black_list;
+                black_list = tmp;
 
                 /* Move to the next element in the stack to search */
                 tmp = grey_list->next;
