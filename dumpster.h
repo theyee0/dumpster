@@ -17,7 +17,7 @@ struct header {
 /* Circular linked lists representing memory blocks */
 static struct header base;
 static struct header *freep = &base;
-static struct header *usedp = &base;
+static struct header *usedp = NULL;
 
 /* Tags representing the usage state of different nodes */
 enum tags {
@@ -140,10 +140,9 @@ void *dumpster_alloc(size_t alloc_size) {
 
         /* Align units of allocation to header size, plus one for an actual header */
         units = (alloc_size + sizeof(struct header) - 1) / sizeof(struct header) + 1;
-        prev = freep;
 
         /* Iterate over free blocks to try to find an existing free block */
-        for (cur = prev->next;; prev = cur, cur = prev->next) {
+        for (prev = freep, cur = untag(prev->next);; prev = cur, cur = untag(prev->next)) {
                 if (cur->size < units) {
                         if (cur == freep) {
                                 /* If the attempt to find a free block failed, allocate a new one */
@@ -158,10 +157,18 @@ void *dumpster_alloc(size_t alloc_size) {
                         /* Add the desired new block to the end of the oversized block */
                         cur->size -= units;
                         cur += cur->size;
-                        cur->size = units;
+                        cur->size = units - 1;
                 } else {
                         /* Extract the current block from the list and join surrounding blocks */
                         prev->next = cur->next;
+                }
+
+                if (usedp == NULL) {
+                        cur->next = cur;
+                        usedp = cur;
+                } else {
+                        cur->next = usedp->next;
+                        usedp->next = cur;
                 }
 
                 return cur + 1;
@@ -511,4 +518,87 @@ void dumpster_collect_incremental() {
         }
 
         collecting = 0;
+}
+
+/* Compute the fraction of memory that is fragmented between used blocks */
+double compute_fragmentation() {
+        struct header *cur = freep;
+        unsigned long long int available = 0;
+        unsigned long long int fragmented = 0;
+
+        /* Compute total available and fragmented memory */
+        do {
+                available += cur->size * sizeof(struct header);
+                fragmented += cur->next - (cur + cur->size);
+
+                cur = untag(cur->next);
+        } while (cur != freep);
+
+        return (double)fragmented / (available + fragmented);
+}
+
+/*
+  Print statistics regarding how much memory is used, what size the memory blocks are, and
+  what type of memory (free, used)
+*/
+double print_statistics(int verbose) {
+        struct header *cur = freep;
+        unsigned long long int free_memory = 0;
+        unsigned long long int used_memory = 0;
+
+        if (cur != NULL) {
+                printf("--- Free Blocks ---\n");
+
+                if (verbose) {
+                        printf("Free block sizes:");
+                }
+
+                do {
+                        if (verbose) {
+                                printf(" (%p, %d)", (void*)cur, cur->size * sizeof(struct header));
+                        }
+
+                        free_memory += cur->size * sizeof(struct header);
+
+                        cur = untag(cur->next);
+                } while (cur != freep);
+
+                if (verbose) {
+                        printf("\n");
+                }
+
+                printf("Free: %dB\n\n", free_memory);
+        } else {
+                printf("--- There are no free blocks of memory currently on standby. ---\n\n");
+        }
+
+        cur = usedp;
+
+        if (cur != NULL) {
+                printf("--- Used Blocks ---\n");
+
+                if (verbose) {
+                        printf("Used block sizes:");
+                }
+
+                do {
+                        if (verbose) {
+                                printf(" (%p, %d)", (void*)cur, cur->size * sizeof(struct header));
+                        }
+
+                        used_memory += cur->size * sizeof(struct header);
+
+                        cur = untag(cur->next);
+                } while (cur != usedp);
+
+                if (verbose) {
+                        printf("\n");
+                }
+
+                printf("Used: %dB\n\n", used_memory);
+        } else {
+                printf("--- No memory is currently in use. ---\n\n");
+        }
+
+        return (double)free_memory / (free_memory + used_memory);
 }
