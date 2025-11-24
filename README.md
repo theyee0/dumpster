@@ -6,7 +6,7 @@ A single-header library providing a rudimentary garbage collection framework for
 
 The provided demo is a simple app meant to somewhat tax the garbage collector by prompting the user and repeatedly allocating memory then "leaking" it before allocating more. Statistics are provided for the memory usage to give more insight into how memory is used. Only one garbage collection pass is performed, just before the program terminates.
 
-Video coming soon...
+https://github.com/user-attachments/assets/ee18c6e5-061c-401e-9bd5-93d6724511b6
 
 ## Usage
 
