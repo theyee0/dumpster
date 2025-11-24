@@ -42,19 +42,19 @@ enum tags {
         GREY = 0x2
 };
 
-void *tag(void *ptr, unsigned long long int tag) {
+static void *tag(void *ptr, unsigned long long int tag) {
         unsigned long long int ptrl = (unsigned long long int)ptr;
 
         return (void*)((ptrl & (~0x3)) | (tag & 0x3));
 }
 
-void *untag(void *ptr) {
+static void *untag(void *ptr) {
         unsigned long long int ptrl = (unsigned long long int)ptr;
 
         return (void*)(ptrl & (~0x3));
 }
 
-unsigned long long int tagof(void *ptr) {
+static unsigned long long int tagof(void *ptr) {
         unsigned long long int ptrl = (unsigned long long int)ptr;
 
         return ptrl & 0x3;
@@ -161,6 +161,19 @@ void *dumpster_alloc(size_t alloc_size) {
         return NULL;
 }
 
+static void tag_unclean_block(struct header *list, void* memval, enum tags color_tag) {
+        struct header *block = list;
+
+        do {
+                if (list != block &&
+                    (void*)(block + 1) <= memval &&
+                    memval <= (void*)(block + block->size + 1)) {
+                        block->next = tag(block->next, color_tag);
+                        break;
+                }
+        } while ((block = untag(block->next)) != list);
+}
+
 /*
   Scan a contiguous memory region for pointers and tag corresponding blocks curerntly in use
 */
@@ -175,13 +188,7 @@ static void scan_region(void *start, void *end) {
                 memval = *(void**)cur;
 
                 /* Iterate through blocks to identify and tag the block an address is from */
-                do {
-                        if ((void*)(block + 1) <= memval &&
-                            memval < (void*)(block + block->size + 1)) {
-                                block->next = tag(block->next, 1);
-                                break;
-                        }
-                } while ((block = untag(block->next)) != usedp);
+                tag_unclean_block(usedp, memval, BLACK);
         }
 }
 
@@ -207,14 +214,7 @@ static void scan_heap(void) {
                         memval = *(void**)cur;
 
                         /* Identify the block a memory address belongs to and tag it as in-use */
-                        for (search = block->next; untag(search) != block; search = untag(search->next)) {
-                                if (search != block &&
-                                    (void*)(search + 1) <= memval &&
-                                    memval <= (void*)(search + search->size + 1)) {
-                                        search->next = tag(search->next, 1);
-                                        break;
-                                }
-                        }
+                        tag_unclean_block(block, memval, BLACK);
                 }
         }
 }
@@ -302,6 +302,35 @@ void dumpster_collect(void) {
         }
 }
 
+static void tag_unclean_block_incremental(struct header *list,
+                                          void* memval,
+                                          struct color_node *new_list,
+                                          enum tags color_tag,
+                                          struct timespec start_time) {
+        struct header *block = list;
+        struct color_node *tmp;
+
+        do {
+                if (list != block &&
+                    (void*)(block + 1) <= memval &&
+                    memval <= (void*)(block + block->size + 1)) {
+                        block->next = tag(block->next, color_tag);
+
+                        tmp = malloc(sizeof(*tmp));
+                        tmp->p = block->next;
+                        tmp->next = new_list;
+                        grey_list = tmp;
+                        break;
+                }
+
+                clock_gettime(CLOCK_REALTIME, &cur_time);
+
+                if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                        return;
+                }
+        } while ((block = untag(block->next)) != list);
+}
+
 /*
   Scan a contiguous memory region for pointers and tag corresponding blocks curerntly in use
 */
@@ -309,38 +338,19 @@ static void scan_region_incremental(void *start, void *end, struct timespec star
         void *cur; /* Current address in memory being examined */
         void *memval; /* Pointer read from value in memory */
         struct header *block; /* Current block in memory */
-        struct color_node *tmp;
 
         /* Iterate over all addresses, aligned to pointer size */
         for (cur = start; cur < end; cur++) {
-                block = usedp;
                 memval = *(void**)cur;
 
                 /* Iterate through blocks to identify and tag the block an address is from */
-                do {
-                        if ((void*)(block + 1) <= memval &&
-                            memval < (void*)(block + block->size + 1)) {
-                                if (tagof(block->next) != WHITE) {
-                                        break;
-                                }
+                tag_unclean_block_incremental(usedp, memval, grey_list, GREY, start_time);
 
-                                /* Tag block and add to the grey list */
-                                block->next = tag(block->next, GREY);
+                clock_gettime(CLOCK_REALTIME, &cur_time);
 
-                                tmp = malloc(sizeof(*tmp));
-                                tmp->p = block->next;
-                                tmp->next = grey_list;
-                                grey_list = tmp;
-
-                                break;
-                        }
-
-                        clock_gettime(CLOCK_REALTIME, &cur_time);
-
-                        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
-                                return;
-                        }
-                } while ((block = untag(block->next)) != usedp);
+                if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
+                        return;
+                }
         }
 }
 
@@ -366,28 +376,7 @@ static void scan_heap_incremental(struct timespec start_time) {
                                 memval = *(void**)cur;
 
                                 /* Identify the block a memory address belongs to and tag it as in-use */
-                                for (search = block->next; untag(search) != block; search = untag(search->next)) {
-                                        if (search != block &&
-                                            (void*)(search + 1) <= memval &&
-                                            memval <= (void*)(search + search->size + 1)) {
-                                                if (tagof(search->next) != WHITE) {
-                                                        break;
-                                                }
-
-                                                search->next = tag(search->next, GREY);
-                                                tmp = malloc(sizeof(*tmp));
-                                                tmp->p = search->next;
-                                                tmp->next = grey_list;
-                                                grey_list = tmp->next;
-                                                break;
-                                        }
-
-                                        clock_gettime(CLOCK_REALTIME, &cur_time);
-
-                                        if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
-                                                return;
-                                        }
-                                }
+                                tag_unclean_block_incremental(cur, memval, grey_list, GREY, start_time);
                         }
 
                         block->next = tag(block->next, BLACK);
