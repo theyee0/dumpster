@@ -14,46 +14,53 @@ struct header {
         struct header *next;
 };
 
-static int initialized = 0;
-static int collecting = 0;
-
-static void *stack_base;
-static void *stack_top;
-
-/* Circular linked lists */
+/* Circular linked lists representing memory blocks */
 static struct header base;
 static struct header *freep = &base;
 static struct header *usedp = &base;
 
-struct color_node {
-        struct header *p;
-        struct color_node *next;
-};
-
-struct timespec cur_time;
-
-/* Tri-color marking algorithm */
-static struct color_node *grey_list = NULL;
-static struct color_node *black_list = NULL;
-
+/* Tags representing the usage state of different nodes */
 enum tags {
         WHITE = 0x0,
         BLACK = 0x1,
         GREY = 0x2
 };
 
+/* Structure for linked list of memory blocks to be searched */
+struct color_node {
+        struct header *p;
+        struct color_node *next;
+};
+
+/* State data */
+static int initialized = 0;
+static int collecting = 0;
+struct timespec cur_time;
+
+/* Location of stack */
+static void *stack_base;
+static void *stack_top;
+
+/* Tri-color marking algorithm */
+static struct color_node *grey_list = NULL;
+static struct color_node *black_list = NULL;
+
+
+/* Given a pointer, return a tagged pointer */
 static void *tag(void *ptr, unsigned long long int tag) {
         unsigned long long int ptrl = (unsigned long long int)ptr;
 
         return (void*)((ptrl & (~0x3)) | (tag & 0x3));
 }
 
+/* Given a tagged pointer, return the actual memory address */
 static void *untag(void *ptr) {
         unsigned long long int ptrl = (unsigned long long int)ptr;
 
         return (void*)(ptrl & (~0x3));
 }
 
+/* Given a tagged pointer, return the value of the tag */
 static unsigned long long int tagof(void *ptr) {
         unsigned long long int ptrl = (unsigned long long int)ptr;
 
@@ -135,9 +142,11 @@ void *dumpster_alloc(size_t alloc_size) {
         units = (alloc_size + sizeof(struct header) - 1) / sizeof(struct header) + 1;
         prev = freep;
 
+        /* Iterate over free blocks to try to find an existing free block */
         for (cur = prev->next;; prev = cur, cur = prev->next) {
                 if (cur->size < units) {
                         if (cur == freep) {
+                                /* If the attempt to find a free block failed, allocate a new one */
                                 cur = morecore(units);
                                 if (cur == NULL) {
                                         return NULL;
@@ -161,10 +170,15 @@ void *dumpster_alloc(size_t alloc_size) {
         return NULL;
 }
 
+/*
+  Given a linked list of memory blocks and a memory address, find the block containing that
+  memory address and tag it with a specified color
+*/
 static void tag_unclean_block(struct header *list, void* memval, enum tags color_tag) {
         struct header *block = list;
 
         do {
+                /* Tag the block if the memory address is between its bounds */
                 if (list != block &&
                     (void*)(block + 1) <= memval &&
                     memval <= (void*)(block + block->size + 1)) {
@@ -231,10 +245,10 @@ void dumpster_init(void)
         }
 
         /* Read stack address from /proc */
-        fp = fopen("/proc/self/stat", "r");
-        if (fp == NULL) {
+        if ((fp = fopen("/proc/self/stat", "r")) == NULL) {
                 return;
         }
+
         fscanf(fp,
                "%*d %*s %*c %*d %*d %*d %*d %*d %*u "
                "%*lu %*lu %*lu %*lu %*lu %*lu %*ld %*ld "
@@ -302,6 +316,12 @@ void dumpster_collect(void) {
         }
 }
 
+/*
+  Given a list of memory blocks and a memory address, find the corresponding memory block
+  and tag it and its descendants.
+
+  Check that the time limit has not been exceeded while doing so, otherwise return early.
+*/
 static void tag_unclean_block_incremental(struct header *list,
                                           void* memval,
                                           struct color_node *new_list,
@@ -310,12 +330,13 @@ static void tag_unclean_block_incremental(struct header *list,
         struct header *block = list;
         struct color_node *tmp;
 
+        /* Iterate over blocks and find the block the address lies between */
         do {
-                if (list != block &&
-                    (void*)(block + 1) <= memval &&
+                if ((void*)(block + 1) <= memval &&
                     memval <= (void*)(block + block->size + 1)) {
                         block->next = tag(block->next, color_tag);
 
+                        /* Allocate a new element and push it into the linked list of grey blocks */
                         tmp = malloc(sizeof(*tmp));
                         tmp->p = block->next;
                         tmp->next = new_list;
@@ -323,6 +344,7 @@ static void tag_unclean_block_incremental(struct header *list,
                         break;
                 }
 
+                /* Check to ensure tha tthe time limit has not been exceeded */
                 clock_gettime(CLOCK_REALTIME, &cur_time);
 
                 if (cur_time.tv_nsec - start_time.tv_nsec >= MAX_DELAY) {
@@ -379,6 +401,7 @@ static void scan_heap_incremental(struct timespec start_time) {
                                 tag_unclean_block_incremental(cur, memval, grey_list, GREY, start_time);
                         }
 
+                        /* Tag the current block once all of its descendants have been searched */
                         block->next = tag(block->next, BLACK);
                         tmp = malloc(sizeof(*tmp));
                         tmp->p = block;
@@ -386,12 +409,22 @@ static void scan_heap_incremental(struct timespec start_time) {
                         black_list = tmp;
                 }
 
+                /* Move to the next element in the stack to search */
                 tmp = grey_list->next;
                 free(grey_list);
                 grey_list = tmp;
         }
 }
 
+/*
+  Incrementally collect memory, obeying a hard time bound for each attempted free.
+
+  If the time bound is exceeded, terminate the search.
+
+  Future function calls will refresh the entries to account for shifting memory, then
+  proceed where the previous call left off. If the previous call was completed, then this is
+  equivalent to beginning a fresh mark and sweep cycle.
+*/
 void dumpster_collect_incremental() {
         struct header *cur, *prev, *tmp;
         extern char end, etext;
@@ -402,6 +435,7 @@ void dumpster_collect_incremental() {
                 return;
         }
 
+        /* Initialize all blocks to be searched if it's a true new collection cycle */
         if (!collecting) {
                 prev = usedp;
 
@@ -412,6 +446,7 @@ void dumpster_collect_incremental() {
                 collecting = 1;
         }
 
+        /* Set the start time for reference */
         clock_gettime(CLOCK_REALTIME, &start_time);
         
         /* Scan data segment */
@@ -443,7 +478,7 @@ void dumpster_collect_incremental() {
         prev = usedp;
         cur = untag(usedp->next);
 
-        /* Stop when all nodes have been searched */
+        /* Stop freeing memory blocks when all nodes have been searched */
         while (cur != usedp) {
                 if (tagof(cur->next) == WHITE) {
                         /* Free a block and reconnect the surrounding linked list */
